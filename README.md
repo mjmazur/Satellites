@@ -13,14 +13,22 @@ The script supports:
 
 - [CheckForSatellites_FOV.py](CheckForSatellites_FOV.py) — main script
 - [satellites.json](satellites.json) — optional calibration satellite list used by --calsats
+- [requirements.txt](requirements.txt) — Python dependency list
+- [install_dependencies.py](install_dependencies.py) — helper installer (installs from requirements.txt)
 
 ## Requirements
 
 Python 3.9+
 
-Install dependencies:
+Install dependencies (recommended):
 
-pip install numpy pandas skyfield
+python install_dependencies.py
+
+Alternative:
+
+python -m pip install -r requirements.txt
+
+The installer script upgrades pip and then installs from requirements.txt.
 
 ## TLE Files
 
@@ -41,6 +49,11 @@ The script selects the closest TLE file for each day segment in the requested UT
 Accepted UTC formats:
 - CSV style: YYYYMMDD:HH:MM:SS.ssssss
 - CLI style: YYYYMMDD_hhmmss
+
+Choose exactly one time input source:
+- --start-time + --end-time
+- --time-file
+- --time-from-system
 
 ## Usage
 
@@ -130,3 +143,4 @@ Output columns include:
 - Use --workers 1 to disable multiprocessing.
 - With --tle-auto, the script prints a per-segment summary showing which TLE file was selected.
 - If no passes are found, no CSV rows are written.
+- --time-from-system is Linux-only and requires /dump.vid/<cam_id>/.
