@@ -12,6 +12,8 @@ The script supports:
 ## Project Files
 
 - [CheckForSatellites_FOV.py](CheckForSatellites_FOV.py) — main script
+- [CheckForSatellites_FOV_py26.py](CheckForSatellites_FOV_py26.py) — Python 2.6-compatible variant
+- [build_time_file_from_system.py](build_time_file_from_system.py) — standalone time_file generator (Python 2.6+ and Python 3)
 - [satellites.json](satellites.json) — optional calibration satellite list used by --calsats
 - [requirements.txt](requirements.txt) — Python dependency list
 - [install_dependencies.py](install_dependencies.py) — helper installer (installs from requirements.txt)
@@ -110,6 +112,28 @@ This option is mutually exclusive with:
 And it requires:
 - --cam_id
 
+## Standalone Time-File Builder
+
+You can pre-generate a `time_file` without running the full pass finder:
+
+python build_time_file_from_system.py --cam-id 01F
+
+Optional arguments:
+- `--dump-dir` (default: `/dump.vid`)
+- `--output` (default: `time_file_from_system_<cam-id>.csv`)
+
+Example:
+
+python build_time_file_from_system.py --cam-id 01F --output ranges_from_system.csv
+
+Then run the main script with that file:
+
+python CheckForSatellites_FOV.py --tle-auto --cam_id 01F --time-file ranges_from_system.csv
+
+Compatibility:
+- This utility script is designed to run on both Python 2.6 and Python 3.
+- It is Linux-only because it scans `/dump.vid/<cam_id>/`.
+
 ## Camera Presets
 
 - 01F: Tavistock, FOV [75, 288, 85, 298]
@@ -144,3 +168,15 @@ Output columns include:
 - With --tle-auto, the script prints a per-segment summary showing which TLE file was selected.
 - If no passes are found, no CSV rows are written.
 - --time-from-system is Linux-only and requires /dump.vid/<cam_id>/.
+
+## Python 2.6 Script
+
+For legacy environments, use:
+
+python CheckForSatellites_FOV_py26.py [options]
+
+Compatibility notes:
+- Uses optparse and multiprocessing.Pool (instead of argparse and concurrent.futures).
+- Maintains the same core workflow: per-day segments, optional --time-from-system, closest-TLE per segment, and CSV output.
+- Uses naive UTC datetime handling to avoid Python 3 timezone APIs.
+- Dependency support on Python 2.6 may vary by platform (especially skyfield/pandas/numpy).
