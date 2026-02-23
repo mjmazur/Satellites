@@ -6,11 +6,55 @@ import os
 import glob
 import numpy as np
 import pandas as pd
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import cpu_count
 from skyfield.api import load, EarthSatellite, wgs84
 from skyfield.timelib import Time
 from datetime import datetime, timedelta, timezone
 
-def find_closest_tle_file(start_time_str):
+def parse_time_utc(time_value):
+    """
+    Parses a UTC time value into a timezone-aware datetime in UTC.
+    Accepts datetime objects or strings in either CSV or CLI formats.
+    """
+    if isinstance(time_value, datetime):
+        if time_value.tzinfo is None:
+            return time_value.replace(tzinfo=timezone.utc)
+        return time_value.astimezone(timezone.utc)
+
+    for time_format in ('%Y%m%d:%H:%M:%S.%f', '%Y%m%d_%H%M%S'):
+        try:
+            return datetime.strptime(str(time_value), time_format).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+
+    raise ValueError(f"Error: Invalid time format for '{time_value}'.")
+
+
+def split_time_range_by_day(start_utc, end_utc):
+    """
+    Splits a UTC datetime range into day-bounded segments.
+    """
+    if end_utc < start_utc:
+        return []
+
+    segments = []
+    current_start = start_utc
+    while current_start <= end_utc:
+        next_day_midnight = datetime(
+            current_start.year,
+            current_start.month,
+            current_start.day,
+            tzinfo=timezone.utc
+        ) + timedelta(days=1)
+        current_end = min(end_utc, next_day_midnight - timedelta(seconds=1))
+        segments.append((current_start, current_end))
+        current_start = next_day_midnight
+
+    return segments
+
+
+def find_closest_tle_file(start_time):
     """
     Finds the TLE file in the 'TLEs/' directory that is closest in date to the start_time.
     TLE filenames are expected in the format 'TLE_YYYYMMDD_hhmmss_*.txt'.
@@ -25,16 +69,7 @@ def find_closest_tle_file(start_time_str):
     if not tle_files:
         raise FileNotFoundError(f"Error: No TLE files found in '{tle_dir}' matching the pattern 'TLE_*.txt'.")
 
-    # Parse the start time, trying multiple formats
-    try:
-        # Try parsing the CSV format first
-        start_time_dt = datetime.strptime(start_time_str, '%Y%m%d:%H:%M:%S.%f')
-    except ValueError:
-        # Fallback to the command-line format
-        try:
-            start_time_dt = datetime.strptime(start_time_str, '%Y%m%d_%H%M%S')
-        except ValueError:
-            raise ValueError(f"Error: Invalid time format for '{start_time_str}'.")
+    start_time_dt = parse_time_utc(start_time).replace(tzinfo=None)
 
     closest_file = None
     min_time_diff = timedelta.max
@@ -62,7 +97,19 @@ def find_closest_tle_file(start_time_str):
 
     return closest_file
 
-def find_satellite_passes(observer, tle_file, start_time_str, end_time_str, fov, calsats_file, results, filename):
+
+def create_observer(observer_config):
+    """
+    Creates a Skyfield observer from a serializable config dictionary.
+    """
+    return wgs84.latlon(
+        observer_config['lat'],
+        observer_config['lon'],
+        elevation_m=observer_config['elev']
+    )
+
+
+def find_satellite_passes(observer, tle_file, start_utc, end_utc, fov, calsats_file, filename):
     """
     Finds satellite passes and appends them to a results list.
     """
@@ -110,19 +157,7 @@ def find_satellite_passes(observer, tle_file, start_time_str, end_time_str, fov,
 
 
 
-    # Parse the time range from the new format
-    try:
-        # Try parsing the CSV format first
-        start_utc = datetime.strptime(start_time_str, '%Y%m%d:%H:%M:%S.%f').replace(tzinfo=timezone.utc)
-        end_utc = datetime.strptime(end_time_str, '%Y%m%d:%H:%M:%S.%f').replace(tzinfo=timezone.utc)
-    except ValueError:
-        # Fallback to the command-line format
-        try:
-            start_utc = datetime.strptime(start_time_str, '%Y%m%d_%H%M%S').replace(tzinfo=timezone.utc)
-            end_utc = datetime.strptime(end_time_str, '%Y%m%d_%H%M%S').replace(tzinfo=timezone.utc)
-        except ValueError:
-            print(f"Error: Invalid time format for '{start_time_str}' or '{end_time_str}'.")
-            return
+    results = []
 
     start_time = ts.utc(start_utc)
     end_time = ts.utc(end_utc)
@@ -139,7 +174,7 @@ def find_satellite_passes(observer, tle_file, start_time_str, end_time_str, fov,
 
     timestamps = ts.from_datetimes(time_points)
     
-    print(f"\nSearching for passes between {start_time_str} and {end_time_str}...")
+    print(f"\nSearching for passes between {start_utc.isoformat()} and {end_utc.isoformat()}...")
     
     passes_found = False
     
@@ -211,6 +246,29 @@ def find_satellite_passes(observer, tle_file, start_time_str, end_time_str, fov,
 
     if not passes_found:
         print(f"No satellite passes found for '{filename}'.")
+
+    return results
+
+
+def process_time_segment(task):
+    """
+    Worker function for multiprocessing: processes one day-bounded segment.
+    """
+    observer = create_observer(task['observer_config'])
+    tle_file_to_use = task.get('resolved_tle_file', task['tle_file'])
+
+    if task['tle_auto'] and tle_file_to_use is None:
+        tle_file_to_use = find_closest_tle_file(task['start_utc'])
+
+    return find_satellite_passes(
+        observer,
+        tle_file_to_use,
+        task['start_utc'],
+        task['end_utc'],
+        task['fov'],
+        task['calsats_file'],
+        task['filename']
+    )
 
 
 def main():
@@ -288,6 +346,12 @@ def main():
         default='calsat_matches.csv',
         help="Path to the output CSV file (default: calsat_matches.csv)."
     )
+    parser.add_argument(
+        '--workers',
+        type=int,
+        default=max(1, cpu_count() - 1),
+        help="Number of worker processes to use (default: CPU count - 1). Use 1 to disable multiprocessing."
+    )
 
     args = parser.parse_args()
 
@@ -313,6 +377,9 @@ def main():
     if not args.cam_id and not args.fov:
         parser.error("You must specify either --cam_id or --fov.")
 
+    if args.workers < 1:
+        parser.error("--workers must be at least 1.")
+
     # --- Site and Camera Configuration ---
     SITES = {
         'elginfield': {'lat': 43.192909, 'lon': -81.315655, 'elev': 327},
@@ -329,22 +396,25 @@ def main():
         cam_info = CAMERAS[args.cam_id]
         site_info = SITES[cam_info['site']]
         fov = cam_info['fov']
-        observer = wgs84.latlon(site_info['lat'], site_info['lon'], elevation_m=site_info['elev'])
+        observer_config = {'lat': site_info['lat'], 'lon': site_info['lon'], 'elev': site_info['elev']}
+        observer = create_observer(observer_config)
         print(f"Using Camera ID '{args.cam_id}': Site='{cam_info['site']}', FOV={fov}")
     else:
         fov = args.fov
         if args.latitude is not None and args.longitude is not None:
-            observer = wgs84.latlon(args.latitude, args.longitude)
+            observer_config = {'lat': args.latitude, 'lon': args.longitude, 'elev': 0}
+            observer = create_observer(observer_config)
             print(f"Using custom observer location: Latitude={args.latitude}°, Longitude={args.longitude}°")
         else:
             site = args.site if args.site else 'elginfield'
             site_info = SITES[site]
-            observer = wgs84.latlon(site_info['lat'], site_info['lon'], elevation_m=site_info['elev'])
+            observer_config = {'lat': site_info['lat'], 'lon': site_info['lon'], 'elev': site_info['elev']}
+            observer = create_observer(observer_config)
             print(f"Using site: '{site}' at Latitude={site_info['lat']}°, Longitude={site_info['lon']}°")
 
 
     calsats_file = 'satellites.json' if args.calsats else None
-    results = []
+    tasks = []
 
     # Load the time ranges from the CSV file
     if args.time_file:
@@ -361,56 +431,107 @@ def main():
             return
 
         # Process each time range from the CSV file
-        for index, row in time_df.iterrows():
+        for row_num, (index, row) in enumerate(time_df.iterrows(), start=1):
             start_time_str = row['beg_utc']
             end_time_str = row['end_utc']
-            filename = row.get('filename', f"Row {index + 1}")
+            filename = row.get('filename', f"Row {row_num}")
 
             print(f"\n{'='*60}")
             print(f"Processing Time Range for '{filename}'")
             print(f"Start: {start_time_str}, End: {end_time_str}")
             print(f"{'='*60}\n")
 
-            tle_file_to_use = args.tle_file
-            if args.tle_auto:
-                try:
-                    tle_file_to_use = find_closest_tle_file(start_time_str)
-                    print(f"Automatically selected TLE file: {tle_file_to_use}")
-                except (FileNotFoundError, ValueError) as e:
-                    print(str(e))
-                    continue
+            try:
+                start_utc = parse_time_utc(start_time_str)
+                end_utc = parse_time_utc(end_time_str)
+            except ValueError as e:
+                print(str(e))
+                continue
 
-            find_satellite_passes(
-                observer,
-                tle_file_to_use,
-                start_time_str,
-                end_time_str,
-                fov,
-                calsats_file,
-                results,
-                filename
-            )
+            if end_utc < start_utc:
+                print(f"Error: End time is before start time for '{filename}'. Skipping.")
+                continue
+
+            for segment_start, segment_end in split_time_range_by_day(start_utc, end_utc):
+                tasks.append({
+                    'observer_config': observer_config,
+                    'tle_file': args.tle_file,
+                    'tle_auto': args.tle_auto,
+                    'start_utc': segment_start,
+                    'end_utc': segment_end,
+                    'fov': fov,
+                    'calsats_file': calsats_file,
+                    'filename': filename
+                })
     else:
         # Process the single time range from command-line arguments
-        tle_file_to_use = args.tle_file
-        if args.tle_auto:
+        try:
+            start_utc = parse_time_utc(args.start_time)
+            end_utc = parse_time_utc(args.end_time)
+        except ValueError as e:
+            print(str(e))
+            return
+
+        if end_utc < start_utc:
+            print("Error: End time is before start time.")
+            return
+
+        for segment_start, segment_end in split_time_range_by_day(start_utc, end_utc):
+            tasks.append({
+                'observer_config': observer_config,
+                'tle_file': args.tle_file,
+                'tle_auto': args.tle_auto,
+                'start_utc': segment_start,
+                'end_utc': segment_end,
+                'fov': fov,
+                'calsats_file': calsats_file,
+                'filename': 'command_line_input'
+            })
+
+    results = []
+    if not tasks:
+        print("No valid time segments to process.")
+        return
+
+    if args.tle_auto:
+        print(f"Selecting closest TLE file per day-segment for {len(tasks)} segment(s).")
+        valid_tasks = []
+        for i, task in enumerate(tasks, start=1):
             try:
-                tle_file_to_use = find_closest_tle_file(args.start_time)
-                print(f"Automatically selected TLE file: {tle_file_to_use}")
+                resolved_tle = find_closest_tle_file(task['start_utc'])
+                task['resolved_tle_file'] = resolved_tle
+                print(
+                    f"  [{i}/{len(tasks)}] {task['filename']} | "
+                    f"{task['start_utc'].isoformat()} -> {task['end_utc'].isoformat()} | "
+                    f"TLE: {resolved_tle}"
+                )
+                valid_tasks.append(task)
             except (FileNotFoundError, ValueError) as e:
                 print(str(e))
-                return
+                print(f"Skipping segment for '{task['filename']}' due to TLE selection error.")
+        tasks = valid_tasks
 
-        find_satellite_passes(
-            observer,
-            tle_file_to_use,
-            args.start_time,
-            args.end_time,
-            fov,
-            calsats_file,
-            results,
-            "command_line_input"
-        )
+        if not tasks:
+            print("No valid time segments to process after TLE selection.")
+            return
+
+    worker_count = min(args.workers, len(tasks))
+    if worker_count > 1:
+        print(f"Processing {len(tasks)} segment(s) using {worker_count} worker processes.")
+        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+            futures = [executor.submit(process_time_segment, task) for task in tasks]
+            for future in as_completed(futures):
+                try:
+                    results.extend(future.result())
+                except (FileNotFoundError, ValueError) as e:
+                    print(str(e))
+    else:
+        print(f"Processing {len(tasks)} segment(s) sequentially.")
+        for task in tasks:
+            try:
+                results.extend(process_time_segment(task))
+            except (FileNotFoundError, ValueError) as e:
+                print(str(e))
 
     # Determine the output filename
     output_filename = args.output_file
