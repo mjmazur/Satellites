@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 import glob
+import platform
 import numpy as np
 import pandas as pd
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -17,6 +18,72 @@ from multiprocessing import cpu_count
 from skyfield.api import load, EarthSatellite, wgs84
 from skyfield.timelib import Time
 from datetime import datetime, timedelta, timezone
+
+
+def generate_time_file_from_system(cam_id):
+    """
+    Builds a CSV time-file from existing .vid files for a camera on Linux.
+
+    Logic:
+    - Require /dump.vid to exist.
+    - Read .vid files from /dump.vid/<cam_id>/ (recursive).
+    - File creation time is treated as begin time.
+    - Each file represents 10 minutes of data.
+    """
+    if platform.system() != 'Linux':
+        raise OSError("Error: --time-from-system is only supported on Linux.")
+
+    dump_vid_dir = '/dump.vid'
+    if not os.path.isdir(dump_vid_dir):
+        raise FileNotFoundError("Error: Required directory '/dump.vid' was not found.")
+
+    cam_dir = os.path.join(dump_vid_dir, cam_id)
+    if not os.path.isdir(cam_dir):
+        raise FileNotFoundError(f"Error: Camera directory '{cam_dir}' was not found.")
+
+    vid_files = []
+    for root, _, files in os.walk(cam_dir):
+        for file_name in files:
+            if file_name.lower().endswith('.vid'):
+                vid_files.append(os.path.join(root, file_name))
+
+    if not vid_files:
+        raise FileNotFoundError(f"Error: No .vid files found under '{cam_dir}'.")
+
+    rows = []
+    warned_about_linux_ctime = False
+    for vid_path in vid_files:
+        stat_info = os.stat(vid_path)
+
+        # Linux generally does not expose true file creation time.
+        # Use st_birthtime when available; otherwise fallback to st_ctime.
+        if hasattr(stat_info, 'st_birthtime'):
+            begin_epoch = stat_info.st_birthtime
+        else:
+            begin_epoch = stat_info.st_ctime
+            if not warned_about_linux_ctime:
+                print("Warning: Linux does not always expose true creation time; using st_ctime as file begin time.")
+                warned_about_linux_ctime = True
+
+        begin_utc = datetime.fromtimestamp(begin_epoch, tz=timezone.utc)
+        end_utc = begin_utc + timedelta(minutes=10) - timedelta(seconds=1)
+
+        rows.append({
+            'filename': os.path.basename(vid_path),
+            'beg_utc': begin_utc.strftime('%Y%m%d:%H:%M:%S.%f'),
+            'end_utc': end_utc.strftime('%Y%m%d:%H:%M:%S.%f'),
+            '_sort_key': begin_utc
+        })
+
+    rows.sort(key=lambda row: row['_sort_key'])
+    for row in rows:
+        row.pop('_sort_key', None)
+
+    output_time_file = f"time_file_from_system_{cam_id}.csv"
+    pd.DataFrame(rows).to_csv(output_time_file, index=False)
+    print(f"Created time-file from system data: {output_time_file} ({len(rows)} entries)")
+
+    return output_time_file
 
 def parse_time_utc(time_value):
     """
@@ -317,6 +384,11 @@ def main():
         help="Path to a CSV file containing time ranges. Overrides start/end times."
     )
     parser.add_argument(
+        '--time-from-system',
+        action='store_true',
+        help="Build a time-file from .vid files in /dump.vid/<cam_id>/ (Linux only)."
+    )
+    parser.add_argument(
         '--start-time',
         default=None,
         help="Start time in YYYYMMDD_hhmmss format."
@@ -384,8 +456,11 @@ def main():
     if args.tle_file and args.tle_auto:
         parser.error("You cannot use both --tle-file and --tle-auto.")
 
-    if not args.time_file and not (args.start_time and args.end_time):
-        parser.error("You must specify either --time-file or both --start-time and --end-time.")
+    if args.time_from_system and (args.time_file or args.start_time or args.end_time):
+        parser.error("--time-from-system cannot be used with --time-file, --start-time, or --end-time.")
+
+    if not args.time_from_system and not args.time_file and not (args.start_time and args.end_time):
+        parser.error("You must specify one of: --time-from-system, --time-file, or both --start-time and --end-time.")
     
     if args.time_file and (args.start_time or args.end_time):
         parser.error("You cannot use --time-file with --start-time or --end-time.")
@@ -398,6 +473,9 @@ def main():
         
     if not args.cam_id and not args.fov:
         parser.error("You must specify either --cam_id or --fov.")
+
+    if args.time_from_system and not args.cam_id:
+        parser.error("--time-from-system requires --cam_id to identify /dump.vid/<cam_id>/.")
 
     if args.workers < 1:
         parser.error("--workers must be at least 1.")
@@ -439,6 +517,13 @@ def main():
     # If --calsats is enabled, limit processing to NORAD IDs listed in satellites.json.
     calsats_file = 'satellites.json' if args.calsats else None
     tasks = []
+
+    if args.time_from_system:
+        try:
+            args.time_file = generate_time_file_from_system(args.cam_id)
+        except (OSError, FileNotFoundError) as e:
+            print(str(e))
+            return
 
     # Build processing tasks (one per day-bounded segment).
     # This is done before execution so the runner can choose sequential or parallel mode.

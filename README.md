@@ -6,6 +6,7 @@ The script supports:
 - Per-day TLE auto-selection (closest TLE file for each UTC day segment)
 - Multiprocessing across time segments
 - Single time-range mode or CSV batch mode
+- Automatic time-file generation from Linux system .vid files
 - Optional filtering to calibration satellites from satellites.json
 
 ## Project Files
@@ -59,6 +60,10 @@ python CheckForSatellites_FOV.py --tle-auto --time-file ranges.csv --cam_id 01F 
 
 python CheckForSatellites_FOV.py --tle-auto --time-file ranges.csv --cam_id 01F --calsats
 
+### 5) Build time-file from existing Linux system files
+
+python CheckForSatellites_FOV.py --tle-auto --cam_id 01F --time-from-system --workers 4
+
 ## CSV Input (for --time-file)
 
 Required columns:
@@ -73,6 +78,24 @@ Example:
 filename,beg_utc,end_utc
 capture_a,20260223:00:00:00.000000,20260223:02:00:00.000000
 capture_b,20260224:10:30:00.000000,20260225:01:00:00.000000
+
+## System Time Extraction (--time-from-system)
+
+When you provide --time-from-system:
+- The script requires Linux.
+- It checks for /dump.vid.
+- It scans /dump.vid/<cam_id>/ recursively for .vid files.
+- Each .vid file contributes one row to a generated CSV:
+	- beg_utc = file creation timestamp (or st_ctime fallback when creation time is unavailable)
+	- end_utc = beg_utc + 10 minutes - 1 second
+- Generated file name: time_file_from_system_<cam_id>.csv
+
+This option is mutually exclusive with:
+- --time-file
+- --start-time / --end-time
+
+And it requires:
+- --cam_id
 
 ## Camera Presets
 
